@@ -1,0 +1,5 @@
+[
+  {"query":"authentication refresh token expiry", "relevant_paths":["app/core/security.py","app/api/routes/auth.py"]},
+  {"query":"repository clone and branch operations", "relevant_paths":["app/services/git_service.py"]},
+  {"query":"run code safely in docker", "relevant_paths":["app/services/sandbox_service.py"]}
+]

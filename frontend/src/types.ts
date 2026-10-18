@@ -1,0 +1,1 @@
+export type Repository={id:number;name:string;clone_url:string;default_branch:string};export type FileNode={path:string;name:string;type:string};export type Task={id:number;repository_id:number;prompt:string;status:string};
