@@ -168,11 +168,14 @@ class OpenRouterProvider(BaseLLMProvider):
             '{"edits":[{"path":"relative/file.py","old_text":"exact existing text","new_text":"replacement text"}]}\n\n'
             "For a NEW file use old_text=null and put the complete new file in new_text.\n"
             "Rules:\n"
+            "- Use ONLY file paths that are present in the supplied context, except for genuinely new files.\n"
+            "- Never invent framework files such as app.py, routes.py, or tests that are not supported by context.\n"
             "- For existing files old_text MUST exactly match supplied text.\n"
             "- Keep old_text small but unique.\n"
             "- Do not return entire existing files.\n"
             "- Make the smallest safe set of edits.\n"
             "- Multiple edits are allowed.\n"
+            "- If PREVIOUS TEST FAILURE contains patch-validation feedback, correct the edit payload itself.\n"
             '- If no safe edit is possible, return {"edits":[]}.\n\n'
             f"TASK:\n{task}\n{failure_text}\nCONTEXT:\n{self._context_text(context)}"
         )
