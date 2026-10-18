@@ -42,14 +42,60 @@ class AgentOrchestrator:
         self,
         task: CodingTask,
         context: list[dict],
-        max_files: int = 4,
+        max_files: int = 6,
     ) -> list[dict]:
+        """Load complete, edit-worthy files instead of blindly trusting retrieval order.
+
+        Retrieval can legitimately rank documentation above source files. For code edits,
+        augment those hits with likely implementation/test files from the repository tree.
+        """
         tools = AgentTools(task.repository.local_path)
+        all_files = tools.list_files()
+        prompt = task.prompt.lower()
+        prompt_tokens = {
+            token.strip(".,:;()[]{}'\\\"")
+            for token in prompt.replace("/", " ").replace("-", " ").split()
+            if len(token.strip(".,:;()[]{}'\\\"")) >= 3
+        }
+
+        def score(path: str) -> tuple[int, int, str]:
+            low = path.lower()
+            name = low.rsplit("/", 1)[-1]
+            value = 0
+            if low.startswith(("src/", "app/", "backend/", "frontend/")):
+                value += 4
+            if "test" in low:
+                value += 5 if any(word in prompt for word in ("test", "route", "endpoint")) else 1
+            if name in {"app.py", "routes.py", "views.py", "router.py", "urls.py", "main.py"}:
+                value += 6
+            if any(token in low for token in prompt_tokens):
+                value += 3
+            if low.startswith(("docs/", "doc/")):
+                value -= 5
+            if low.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java")):
+                value += 2
+            return (-value, len(path), path)
+
         paths: list[str] = []
-        for item in context:
+        for item in sorted(
+            context,
+            key=lambda item: (
+                item["path"].lower().startswith(("docs/", "doc/")),
+                item["path"],
+            ),
+        ):
             path = item["path"]
-            if path not in paths:
+            if path in all_files and path not in paths:
                 paths.append(path)
+            if len(paths) >= max_files:
+                break
+
+        for path in sorted(all_files, key=score):
+            if path in paths:
+                continue
+            if score(path)[0] >= 0:
+                continue
+            paths.append(path)
             if len(paths) >= max_files:
                 break
 
@@ -109,10 +155,8 @@ class AgentOrchestrator:
             except Exception as exc:
                 errors.append(f"{path}: {exc}")
 
-        for message in errors:
-            self.db.add(
-                AgentStep(run_id=run.id, kind="edit_error", detail=message)
-            )
+        if errors:
+            raise ValueError("Invalid proposed edits: " + " | ".join(errors[:8]))
 
         created: list[CodeChange] = []
         for path, proposed in working.items():
@@ -174,7 +218,7 @@ class AgentOrchestrator:
             edit_context = self._expanded_context(
                 task,
                 retrieval_context,
-                max_files=4,
+                max_files=6,
             )
             self.db.add(
                 AgentStep(
@@ -184,8 +228,57 @@ class AgentOrchestrator:
                 )
             )
 
-            edits = self.provider.propose_edits(task.prompt, edit_context)
-            recorded_changes = self._record_edits(run, task, edits)
+            recorded_changes: list[CodeChange] = []
+            patch_error: str | None = None
+            patch_attempts = min(max(settings.llm_max_attempts, 1), 3)
+
+            for patch_attempt in range(1, patch_attempts + 1):
+                try:
+                    edits = self.provider.propose_edits(
+                        task.prompt,
+                        edit_context,
+                        failure=patch_error,
+                    )
+                    if not edits:
+                        patch_error = (
+                            "No edits were returned. Re-check the repository structure and "
+                            "produce the smallest safe change using only files present in context."
+                        )
+                        raise ValueError(patch_error)
+
+                    recorded_changes = self._record_edits(run, task, edits)
+                    if not recorded_changes:
+                        patch_error = "The proposed edits produced no effective file changes."
+                        raise ValueError(patch_error)
+
+                    if patch_attempt > 1:
+                        self.db.add(
+                            AgentStep(
+                                run_id=run.id,
+                                kind="patch_retry_success",
+                                detail=f"Generated a valid patch on attempt {patch_attempt}",
+                            )
+                        )
+                    break
+                except Exception as exc:
+                    patch_error = str(exc)[:4000]
+                    self.db.add(
+                        AgentStep(
+                            run_id=run.id,
+                            kind="patch_retry",
+                            detail=(
+                                f"Patch attempt {patch_attempt}/{patch_attempts} failed: "
+                                f"{patch_error}"
+                            ),
+                        )
+                    )
+                    self.db.commit()
+                    if patch_attempt >= patch_attempts:
+                        raise RuntimeError(
+                            f"Could not generate a valid patch after {patch_attempts} attempts: "
+                            f"{patch_error}"
+                        ) from exc
+
             change_count = len(recorded_changes)
 
             if change_count:
